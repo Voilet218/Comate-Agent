@@ -202,8 +202,6 @@ src/main/java/com/paicli/
 
 以下在路线图但未交付：容器/VM 沙箱 / MCP OAuth + sampling + server 自动重启
 
-不要把 `ROADMAP.md` 中"将来要做"误读成"现在已有"。
-
 ## 持续维护约定
 
 形成稳定协作规则时直接补进本文件，不要只留在聊天记录里。详细实现细节补到 `docs/agents-reference.md`。

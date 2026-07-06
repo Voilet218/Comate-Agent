@@ -22,6 +22,7 @@ public class MemoryManager {
     private final LongTermMemory longTermMemory;
     private final ContextCompressor compressor;
     private final MemoryRetriever retriever;
+    private final SessionStore sessionStore;
     private TokenBudget tokenBudget;
     private ContextProfile contextProfile;
     private String currentProject;
@@ -51,6 +52,7 @@ public class MemoryManager {
         this.retriever = new MemoryRetriever(shortTermMemory, this.longTermMemory);
         this.tokenBudget = new TokenBudget(contextProfile.maxContextWindow());
         this.currentProject = defaultProjectKey();
+        this.sessionStore = new SessionStore();
     }
 
     public void setLlmClient(LlmClient llmClient) {
@@ -83,6 +85,7 @@ public class MemoryManager {
                 MemoryEntry.estimateTokens(content)
         );
         shortTermMemory.store(entry);
+        sessionStore.append(entry);
         compressIfNeeded();
     }
 
@@ -98,6 +101,7 @@ public class MemoryManager {
                 MemoryEntry.estimateTokens(content)
         );
         shortTermMemory.store(entry);
+        sessionStore.append(entry);
         compressIfNeeded();
     }
 
@@ -120,6 +124,7 @@ public class MemoryManager {
                 MemoryEntry.estimateTokens(content)
         );
         shortTermMemory.store(entry);
+        sessionStore.append(entry);
         compressIfNeeded();
     }
 
@@ -235,6 +240,22 @@ public class MemoryManager {
     public ContextProfile getContextProfile() { return contextProfile; }
 
     public String getCurrentProject() { return currentProject; }
+
+    public SessionStore getSessionStore() { return sessionStore; }
+
+    /**
+     * 搜索历史 session 记录，供 search_session 工具调用。
+     */
+    public List<SessionEntry> searchSession(String query, int limit, Integer sessionId) {
+        return sessionStore.search(query, limit, sessionId);
+    }
+
+    /**
+     * 关闭 MemoryManager，释放 SessionStore 资源。
+     */
+    public void close() {
+        sessionStore.close();
+    }
 
     private static String normalizeScope(String scope) {
         if (scope == null || scope.isBlank()) {

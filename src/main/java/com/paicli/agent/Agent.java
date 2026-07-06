@@ -30,6 +30,8 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.io.PrintStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
@@ -54,6 +56,10 @@ public class Agent {
     private Renderer renderer;
     private Supplier<Boolean> hitlEnabledSupplier = () -> false;
     private final PromptAssembler promptAssembler = PromptAssembler.createDefault();
+    /** 会话启动时从项目根加载的 agent.md 快照，会话期间固定不变 */
+    private String agentMdContent;
+    /** 外部流式监听器（由 WeChatStreamListener 等实现），在 Agent 流式输出同时转发消息 */
+    private LlmClient.StreamListener externalStreamListener;
 
     public Agent(LlmClient llmClient) {
         this(llmClient, new ToolRegistry());
@@ -68,6 +74,8 @@ public class Agent {
         this.toolRegistry.setContextProfile(memoryManager.getContextProfile());
         this.memoryManager.setProjectPath(this.toolRegistry.getProjectPath());
         this.toolRegistry.setScopedMemorySaver(memoryManager::storeFact);
+        this.toolRegistry.setSessionSearcher(memoryManager::searchSession);
+        this.agentMdContent = loadAgentMd(Path.of(toolRegistry.getProjectPath()));
         conversationHistory.add(LlmClient.Message.system(buildSystemPrompt("")));
     }
 
@@ -100,6 +108,14 @@ public class Agent {
      */
     public void setHitlEnabledSupplier(Supplier<Boolean> supplier) {
         this.hitlEnabledSupplier = supplier == null ? () -> false : supplier;
+    }
+
+    /**
+     * 注入外部流式监听器（如 WeChatStreamListener）。
+     * 设置后 Agent 流式输出时，每个 delta 会同时转发给外部监听器。
+     */
+    public void setExternalStreamListener(LlmClient.StreamListener listener) {
+        this.externalStreamListener = listener;
     }
 
     /**
@@ -169,11 +185,14 @@ public class Agent {
                 List<LlmClient.Tool> toolDefinitions = toolRegistry.getToolDefinitions();
                 logRequestContext("react iteration=" + iteration, toolDefinitions);
                 streamRenderer.beginThinking();
-                // 调用 LLM
+                // 调用 LLM（如有外部监听器如 WeChatStreamListener，组合转发）
+                LlmClient.StreamListener effectiveListener = externalStreamListener != null
+                        ? new ForwardingListener(streamRenderer, externalStreamListener)
+                        : streamRenderer;
                 LlmClient.ChatResponse response = llmClient.chat(
                         conversationHistory,
                         toolDefinitions,
-                        streamRenderer
+                        effectiveListener
                 );
                 LlmTraceLogger.logReasoning(log, "react iteration=" + iteration, llmClient, response.reasoningContent());
                 if (CancellationContext.isCancelled()) {
@@ -269,11 +288,16 @@ public class Agent {
     }
 
     private String buildSystemPrompt(String memoryContext) {
-        return promptAssembler.assemble(PromptMode.AGENT, PromptContext.builder()
+        String prompt = promptAssembler.assemble(PromptMode.AGENT, PromptContext.builder()
                 .memoryContext(memoryContext)
                 .externalContext(buildExternalContext())
                 .skillIndex(buildSkillIndex())
                 .build());
+        // 追加 agent.md 快照（会话启动时加载，整轮会话固定）
+        if (agentMdContent != null && !agentMdContent.isBlank()) {
+            prompt = prompt + "\n\n## Project Instructions\n\n" + agentMdContent;
+        }
+        return prompt;
     }
 
     private void maybeCompactHistory() {
@@ -335,6 +359,25 @@ public class Agent {
         String drained = skillContextBuffer.drain();
         if (drained.isEmpty()) return userInput;
         return drained + "\n用户输入：\n" + userInput;
+    }
+
+    /**
+     * 从项目根加载 agent.md，如果不存在则返回 null。
+     * 仅在会话启动时调用一次，结果缓存到 agentMdContent 供整轮会话使用。
+     */
+    private String loadAgentMd(Path projectRoot) {
+        Path mdPath = projectRoot.resolve("agent.md");
+        if (!Files.isRegularFile(mdPath)) {
+            return null;
+        }
+        try {
+            String content = Files.readString(mdPath, StandardCharsets.UTF_8).trim();
+            log.info("Loaded agent.md ({} chars)", content.length());
+            return content;
+        } catch (IOException e) {
+            log.warn("Failed to read agent.md: {}", e.getMessage());
+            return null;
+        }
     }
 
     private String buildExternalContext() {
@@ -995,6 +1038,31 @@ public class Agent {
                 out().println(AnsiStyle.heading("🧠 思考过程"));
                 reasoningHeadingPrinted = true;
             }
+        }
+    }
+
+    /**
+     * 组合式监听器 - 将流式输出同时转发给主渲染器和外部监听器（如 WeChatStreamListener）。
+     */
+    private static final class ForwardingListener implements LlmClient.StreamListener {
+        private final LlmClient.StreamListener primary;
+        private final LlmClient.StreamListener extra;
+
+        ForwardingListener(LlmClient.StreamListener primary, LlmClient.StreamListener extra) {
+            this.primary = primary;
+            this.extra = extra;
+        }
+
+        @Override
+        public void onReasoningDelta(String delta) {
+            primary.onReasoningDelta(delta);
+            extra.onReasoningDelta(delta);
+        }
+
+        @Override
+        public void onContentDelta(String delta) {
+            primary.onContentDelta(delta);
+            extra.onContentDelta(delta);
         }
     }
 }

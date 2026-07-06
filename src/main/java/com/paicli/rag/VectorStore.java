@@ -61,6 +61,21 @@ public class VectorStore implements AutoCloseable {
                 )
                 """;
 
+        // 文档块表：存储文档分块内容
+        String createDocChunks = """
+                CREATE TABLE IF NOT EXISTS doc_chunks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    project_path TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    title TEXT,
+                    doc_type TEXT NOT NULL,
+                    chunk_index INTEGER NOT NULL,
+                    content TEXT NOT NULL,
+                    embedding_json TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+                """;
+
         // 索引加速查询
         String createIdxProject = "CREATE INDEX IF NOT EXISTS idx_project ON code_chunks(project_path)";
         String createIdxFile = "CREATE INDEX IF NOT EXISTS idx_file ON code_chunks(file_path)";
@@ -68,16 +83,23 @@ public class VectorStore implements AutoCloseable {
         String createIdxRelProject = "CREATE INDEX IF NOT EXISTS idx_rel_project ON code_relations(project_path)";
         String createIdxRelFrom = "CREATE INDEX IF NOT EXISTS idx_rel_from ON code_relations(from_name)";
         String createIdxRelTo = "CREATE INDEX IF NOT EXISTS idx_rel_to ON code_relations(to_name)";
+        String createIdxDocProject = "CREATE INDEX IF NOT EXISTS idx_doc_project ON doc_chunks(project_path)";
+        String createIdxDocFile = "CREATE INDEX IF NOT EXISTS idx_doc_file ON doc_chunks(file_path)";
+        String createIdxDocType = "CREATE INDEX IF NOT EXISTS idx_doc_type ON doc_chunks(doc_type)";
 
         try (Statement stmt = connection.createStatement()) {
             stmt.execute(createChunks);
             stmt.execute(createRelations);
+            stmt.execute(createDocChunks);
             stmt.execute(createIdxProject);
             stmt.execute(createIdxFile);
             stmt.execute(createIdxType);
             stmt.execute(createIdxRelProject);
             stmt.execute(createIdxRelFrom);
             stmt.execute(createIdxRelTo);
+            stmt.execute(createIdxDocProject);
+            stmt.execute(createIdxDocFile);
+            stmt.execute(createIdxDocType);
         }
     }
 
@@ -276,6 +298,131 @@ public class VectorStore implements AutoCloseable {
         return results;
     }
 
+    // ════════════════════════════════════════════
+    //  文档存储（doc_chunks 表）
+    // ════════════════════════════════════════════
+
+    /**
+     * 清空指定文档的所有索引数据
+     */
+    public void clearDocByFile(String filePath) throws SQLException {
+        String sql = "DELETE FROM doc_chunks WHERE project_path = ? AND file_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, projectPath);
+            ps.setString(2, filePath);
+            ps.executeUpdate();
+        }
+    }
+
+    /**
+     * 批量插入文档块（事务保护）
+     */
+    public void insertDocChunks(List<DocChunkEntry> entries) throws SQLException {
+        String sql = """
+                INSERT INTO doc_chunks (project_path, file_path, title, doc_type, chunk_index, content, embedding_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """;
+        boolean autoCommit = connection.getAutoCommit();
+        connection.setAutoCommit(false);
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            for (DocChunkEntry entry : entries) {
+                ps.setString(1, projectPath);
+                ps.setString(2, entry.chunk.filePath());
+                ps.setString(3, entry.chunk.title());
+                ps.setString(4, entry.chunk.docType());
+                ps.setInt(5, entry.chunk.chunkIndex());
+                ps.setString(6, entry.chunk.content());
+                ps.setString(7, embeddingToJson(entry.embedding));
+                ps.addBatch();
+            }
+            ps.executeBatch();
+            connection.commit();
+        } catch (SQLException e) {
+            connection.rollback();
+            throw e;
+        } finally {
+            connection.setAutoCommit(autoCommit);
+        }
+    }
+
+    /**
+     * 文档语义检索
+     */
+    public List<DocSearchResult> searchDocs(float[] queryEmbedding, int topK) throws SQLException {
+        String sql = "SELECT file_path, title, doc_type, chunk_index, content, embedding_json FROM doc_chunks WHERE project_path = ?";
+        List<DocSearchResult> candidates = new ArrayList<>();
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, projectPath);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    String embeddingJson = rs.getString("embedding_json");
+                    if (embeddingJson == null || embeddingJson.isEmpty()) continue;
+
+                    float[] embedding = jsonToEmbedding(embeddingJson);
+                    double similarity = cosineSimilarity(queryEmbedding, embedding);
+                    candidates.add(new DocSearchResult(
+                            rs.getString("file_path"),
+                            rs.getString("title"),
+                            rs.getString("doc_type"),
+                            rs.getInt("chunk_index"),
+                            rs.getString("content"),
+                            similarity
+                    ));
+                }
+            }
+        }
+
+        candidates.sort((a, b) -> Double.compare(b.similarity(), a.similarity()));
+        return candidates.size() > topK ? new ArrayList<>(candidates.subList(0, topK)) : candidates;
+    }
+
+    /**
+     * 文档关键词检索
+     */
+    public List<DocSearchResult> searchDocsByKeyword(String keyword) throws SQLException {
+        String sql = """
+                SELECT file_path, title, doc_type, chunk_index, content FROM doc_chunks
+                WHERE project_path = ? AND (title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')
+                """;
+        List<DocSearchResult> results = new ArrayList<>();
+        String escaped = keyword.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_");
+        String pattern = "%" + escaped + "%";
+
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, projectPath);
+            ps.setString(2, pattern);
+            ps.setString(3, pattern);
+            try (ResultSet rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    results.add(new DocSearchResult(
+                            rs.getString("file_path"),
+                            rs.getString("title"),
+                            rs.getString("doc_type"),
+                            rs.getInt("chunk_index"),
+                            rs.getString("content"),
+                            0.3
+                    ));
+                }
+            }
+        }
+        return results;
+    }
+
+    /**
+     * 文档统计信息
+     */
+    public DocStats getDocStats() throws SQLException {
+        String sql = "SELECT COUNT(*) FROM doc_chunks WHERE project_path = ?";
+        try (PreparedStatement ps = connection.prepareStatement(sql)) {
+            ps.setString(1, projectPath);
+            try (ResultSet rs = ps.executeQuery()) {
+                int count = rs.next() ? rs.getInt(1) : 0;
+                return new DocStats(count);
+            }
+        }
+    }
+
     /**
      * 统计当前项目的索引数据量
      */
@@ -356,4 +503,20 @@ public class VectorStore implements AutoCloseable {
      * 索引统计
      */
     public record IndexStats(int chunkCount, int relationCount) {}
+
+    /**
+     * 带向量的文档块条目（用于 doc_chunks 表）
+     */
+    public record DocChunkEntry(DocChunk chunk, float[] embedding) {}
+
+    /**
+     * 文档检索结果
+     */
+    public record DocSearchResult(String filePath, String title, String docType,
+                                   int chunkIndex, String content, double similarity) {}
+
+    /**
+     * 文档库统计
+     */
+    public record DocStats(int chunkCount) {}
 }

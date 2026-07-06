@@ -15,6 +15,7 @@ import com.paicli.hitl.HitlToolRegistry;
 import com.paicli.hitl.SwitchableHitlHandler;
 import com.paicli.hitl.RendererHitlHandler;
 import com.paicli.hitl.TerminalHitlHandler;
+import com.paicli.wechat.WeChatDaemon;
 import com.paicli.llm.LlmClient;
 import com.paicli.llm.LlmClientFactory;
 import com.paicli.memory.LongTermMemory;
@@ -30,6 +31,7 @@ import com.paicli.mcp.McpServerStatus;
 import com.paicli.mcp.mention.AtMentionExpander;
 import com.paicli.plan.ExecutionPlan;
 import com.paicli.rag.CodeIndex;
+import com.paicli.rag.DocIndex;
 import com.paicli.hitl.ApprovalPolicy;
 import com.paicli.policy.AuditLog;
 import com.paicli.rag.CodeRetriever;
@@ -133,7 +135,7 @@ public class Main {
         CONTROL_SEQUENCE,
         OTHER
     }
-
+    //两种输入模式，正常文本和esc
     private record PromptInput(String text, boolean canceled) {
         static PromptInput submitted(String text) {
             return new PromptInput(text, false);
@@ -188,7 +190,11 @@ public class Main {
         configureAwtForCli();
         if (isRuntimeServeCommand(args)) {
             configureLogging();
-            startRuntimeApiAndBlock(args);
+            if (java.util.Arrays.stream(args).anyMatch("--wechat"::equalsIgnoreCase)) {
+                startWeChatDaemonAndBlock(args);
+            } else {
+                startRuntimeApiAndBlock(args);
+            }
             return;
         }
 
@@ -308,6 +314,7 @@ public class Main {
             }
             boolean nextTaskUsePlanMode = false;
             boolean nextTaskUseTeamMode = false;
+            WeChatDaemon wechatDaemon = null;
 
             // === TUI / CLI 分支判断 ===
             // 旧 PAICLI_TUI=true 路径仍走 Lanterna 全屏 TUI（Day 5 后由 LanternaRenderer 接管）。
@@ -539,6 +546,31 @@ public class Main {
                         handleConfigPalette(renderer, config, llmClient, hitlHandler, skillRegistry);
                         continue;
                     }
+                    case WECHAT -> {
+                        String action = command.payload();
+                        if ("stop".equals(action)) {
+                            if (wechatDaemon != null && wechatDaemon.isRunning()) {
+                                wechatDaemon.close();
+                                ui.println("⏹️ 微信互通已停止\n");
+                            } else {
+                                ui.println("📱 微信互通未运行\n");
+                            }
+                        } else {
+                            if (wechatDaemon != null && wechatDaemon.isRunning()) {
+                                ui.println("📱 微信互通已在运行中\n");
+                            } else {
+                                wechatDaemon = new WeChatDaemon();
+                                wechatDaemon.setLlmClient(llmClient);
+                                if (wechatDaemon.start()) {
+                                    ui.println("✅ 微信互通已启动，在微信 ClawBot 中发消息即可\n");
+                                } else {
+                                    ui.println("❌ 微信互通启动失败，详见日志\n");
+                                }
+                            }
+                        }
+                        renderer.updateStatus(statusInfo(llmClient, hitlHandler, "idle", mcpServerManager, skillRegistry));
+                        continue;
+                    }
                     case AUDIT_TAIL -> {
                         printAuditTail(ui, reactAgent, command.payload());
                         continue;
@@ -633,6 +665,13 @@ public class Main {
                         String absPath = new File(indexPath).getAbsolutePath();
                         reactAgent.getToolRegistry().setProjectPath(absPath);
                         reactAgent.getMemoryManager().setProjectPath(absPath);
+                        continue;
+                    }
+                    case DOC_INDEX -> {
+                        String docPath = command.payload() != null ? command.payload() : ".";
+                        DocIndex indexer = new DocIndex(ui::println);
+                        indexer.indexDirectory(docPath);
+                        ui.println();
                         continue;
                     }
                     case SEARCH_CODE -> {
@@ -759,10 +798,14 @@ public class Main {
     }
 
     private static boolean isRuntimeServeCommand(String[] args) {
-        return args != null
-                && args.length >= 1
-                && "serve".equalsIgnoreCase(args[0])
-                && java.util.Arrays.stream(args).anyMatch("--http"::equalsIgnoreCase);
+        if (args == null || args.length < 1) {
+            return false;
+        }
+        if (!"serve".equalsIgnoreCase(args[0])) {
+            return false;
+        }
+        return java.util.Arrays.stream(args).anyMatch(a ->
+                "--http".equalsIgnoreCase(a) || "--wechat".equalsIgnoreCase(a));
     }
 
     private static void startRuntimeApiAndBlock(String[] args) {
@@ -793,6 +836,30 @@ public class Main {
         } catch (Exception e) {
             System.err.println("❌ Runtime API 启动失败: " + e.getMessage());
             System.exit(1);
+        }
+    }
+
+    private static void startWeChatDaemonAndBlock(String[] args) {
+        PaiCliConfig config = PaiCliConfig.load();
+        LlmClient client = LlmClientFactory.createFromConfig(config);
+        if (client == null) {
+            System.err.println("❌ 错误: 未找到可用的 API Key");
+            System.err.println("请在 .env 文件中添加 GLM_API_KEY、DEEPSEEK_API_KEY、STEP_API_KEY 或 KIMI_API_KEY");
+            System.exit(1);
+        }
+        WeChatDaemon daemon = new WeChatDaemon();
+        daemon.setLlmClient(client);
+        boolean started = daemon.start();
+        if (!started) {
+            System.err.println("❌ 微信守护进程启动失败");
+            System.exit(1);
+        }
+        System.out.println("✅ 微信互通已启动，在微信 ClawBot 中发送消息即可");
+        System.out.println("   按 Ctrl+C 停止");
+        try {
+            new java.util.concurrent.CountDownLatch(1).await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -1310,6 +1377,8 @@ public class Main {
                 new SlashCommandHint("/skill on ", "/skill on <name>", "启用 skill"),
                 new SlashCommandHint("/skill off ", "/skill off <name>", "禁用 skill"),
                 new SlashCommandHint("/skill reload", "/skill reload", "重新扫描 skill 目录"),
+                new SlashCommandHint("/wechat", "/wechat", "启动微信互通模式"),
+                new SlashCommandHint("/wechat stop", "/wechat stop", "停止微信互通"),
                 new SlashCommandHint("/exit", "/exit", "退出 PaiCLI"),
                 new SlashCommandHint("/quit", "/quit", "退出 PaiCLI")
         );
@@ -2188,7 +2257,7 @@ public class Main {
         String capabilities = "ReAct · Plan · MCP · Browser · Image · Tools · Memory · RAG";
         String state = mcp + " · " + skills + " · ReAct";
         List<String> lines = new ArrayList<>(List.of(
-                "   " + AnsiStyle.section("██████████") + "    " + AnsiStyle.emphasis("PaiCLI") + " " + AnsiStyle.section("π") + "  " + AnsiStyle.subtle("v" + VERSION),
+                "   " + AnsiStyle.section("██████████") + "    " + AnsiStyle.emphasis("Comate") + " " + AnsiStyle.section(" ") + "  " + AnsiStyle.subtle("v" + VERSION),
                 "   " + AnsiStyle.section("  ██  ██") + "    " + AnsiStyle.subtle(ready),
                 "   " + AnsiStyle.section("  ██  ██") + "    " + AnsiStyle.subtle(state),
                 "   " + AnsiStyle.section("  ██  ██") + "    " + AnsiStyle.subtle(capabilities),

@@ -20,6 +20,7 @@ final class CliCommandParser {
         MEMORY_SEARCH,
         MEMORY_SAVE,
         INDEX_CODE,
+        DOC_INDEX,
         SEARCH_CODE,
         GRAPH_QUERY,
         CONTEXT_STATUS,
@@ -41,7 +42,8 @@ final class CliCommandParser {
         SKILL_ON,
         SKILL_OFF,
         SKILL_RELOAD,
-        CONFIG
+        CONFIG,
+        WECHAT
     }
 
     record ParsedCommand(CommandType type, String payload) {
@@ -162,6 +164,14 @@ final class CliCommandParser {
             return new ParsedCommand(CommandType.INDEX_CODE, trimmed.substring(7).trim());
         }
 
+        if (trimmed.equalsIgnoreCase("/doc-index")) {
+            return new ParsedCommand(CommandType.DOC_INDEX, null);
+        }
+
+        if (trimmed.regionMatches(true, 0, "/doc-index ", 0, 11)) {
+            return new ParsedCommand(CommandType.DOC_INDEX, trimmed.substring(11).trim());
+        }
+
         if (trimmed.equalsIgnoreCase("/search")) {
             return new ParsedCommand(CommandType.SEARCH_CODE, null);
         }
@@ -276,6 +286,14 @@ final class CliCommandParser {
 
         if (trimmed.regionMatches(true, 0, "/mcp enable ", 0, 12)) {
             return new ParsedCommand(CommandType.MCP_ENABLE, trimmed.substring(12).trim());
+        }
+
+        if (trimmed.equalsIgnoreCase("/wechat")) {
+            return new ParsedCommand(CommandType.WECHAT, "start");
+        }
+
+        if (trimmed.equalsIgnoreCase("/wechat stop")) {
+            return new ParsedCommand(CommandType.WECHAT, "stop");
         }
 
         if (trimmed.startsWith("/")) {

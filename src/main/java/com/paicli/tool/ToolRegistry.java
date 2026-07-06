@@ -12,7 +12,11 @@ import com.paicli.context.ContextProfile;
 import com.paicli.lsp.LspDiagnosticReport;
 import com.paicli.lsp.LspManager;
 import com.paicli.mcp.protocol.McpToolDescriptor;
+import com.paicli.memory.SessionEntry;
 import com.paicli.rag.CodeRetriever;
+import com.paicli.rag.DocIndex;
+import com.paicli.rag.DocRetriever;
+import com.paicli.rag.DocResultFormatter;
 import com.paicli.rag.SearchResultFormatter;
 import com.paicli.rag.VectorStore;
 import com.paicli.policy.AuditLog;
@@ -89,6 +93,7 @@ public class ToolRegistry {
     private BrowserGuard browserGuard;
     private BrowserConnector browserConnector;
     private BiConsumer<String, String> memorySaver;
+    private SessionSearcher sessionSearcher;
     private SkillRegistry skillRegistry;
     private SkillContextBuffer skillContextBuffer;
     private java.util.function.BiConsumer<String, String[]> writeFileObserver = (p, ba) -> {};
@@ -111,7 +116,8 @@ public class ToolRegistry {
         registerFileTools();
         registerShellTools();
         registerCodeTools();
-        registerRagTools();
+//        registerRagTools();
+        registerDocTools();
         registerWebTools();
         registerBrowserTools();
         registerMemoryTools();
@@ -167,6 +173,10 @@ public class ToolRegistry {
 
     public void setScopedMemorySaver(BiConsumer<String, String> memorySaver) {
         this.memorySaver = memorySaver;
+    }
+
+    public void setSessionSearcher(SessionSearcher sessionSearcher) {
+        this.sessionSearcher = sessionSearcher;
     }
 
     public void setSkillRegistry(SkillRegistry skillRegistry) {
@@ -570,39 +580,105 @@ public class ToolRegistry {
     /**
      * 注册 RAG 检索工具
      */
-    private void registerRagTools() {
-        tools.put("search_code", new Tool(
-                "search_code",
-                "RAG 语义辅助检索代码库，根据自然语言描述查找相关代码块；精确符号/字符串定位请优先用 grep_code/glob_files/read_file；默认 top_k=5，可显式指定（上限 30）",
+    // private void registerRagTools() {
+    //     tools.put("search_code", new Tool(
+    //             "search_code",
+    //             "RAG 语义辅助检索代码库，根据自然语言描述查找相关代码块；精确符号/字符串定位请优先用 grep_code/glob_files/read_file；默认 top_k=5，可显式指定（上限 30）",
+    //             createParameters(
+    //                     new Param("query", "string", "自然语言查询描述，例如'用户登录的实现'", true),
+    //                     new Param("top_k", "integer", "返回结果数量（默认 5，上限 30）", false)
+    //             ),
+    //             args -> {
+    //                 String query = args.get("query");
+    //                 int topK = 5;
+    //                 try {
+    //                     if (args.containsKey("top_k")) {
+    //                         topK = Integer.parseInt(args.get("top_k"));
+    //                     }
+    //                 } catch (NumberFormatException ignored) {
+    //                 }
+    //                 topK = Math.max(1, Math.min(topK, 30));
+
+    //                 try (CodeRetriever retriever = new CodeRetriever(projectPath)) {
+    //                     var stats = retriever.getStats();
+    //                     if (stats.chunkCount() == 0) {
+    //                         return "代码库尚未索引，请先使用 /index 命令索引当前项目。";
+    //                     }
+
+    //                     List<VectorStore.SearchResult> results = retriever.hybridSearch(query, topK);
+    //                     if (results.isEmpty()) {
+    //                         return "未找到与查询相关的代码。";
+    //                     }
+
+    //                     return SearchResultFormatter.formatForTool(query, results);
+    //                 } catch (Exception e) {
+    //                     return "代码检索失败: " + e.getMessage();
+    //                 }
+    //             }
+    //     ));
+    // }
+
+    /**
+     * 注册文档检索工具
+     */
+    private void registerDocTools() {
+        tools.put("upload_document", new Tool(
+                "upload_document",
+                "上传一个文档文件到知识库并建立索引，之后可以通过 search_docs 检索。" +
+                        "支持的格式: .txt .md。" +
+                        "⚠️ 仅当用户明确要求‘上传文档’、‘学习文档’、‘阅读资料’、‘根据文档回答’等主动涉及文档库的场景才调用。",
                 createParameters(
-                        new Param("query", "string", "自然语言查询描述，例如'用户登录的实现'", true),
-                        new Param("top_k", "integer", "返回结果数量（默认 5，上限 30）", false)
+                        new Param("path", "string", "文档文件路径（绝对路径或项目内相对路径）", true)
+                ),
+                args -> {
+                    String path = args.get("path");
+                    if (path == null || path.isBlank()) {
+                        return "upload_document 失败: path 不能为空";
+                    }
+                    Path docPath = pathGuard.resolveSafe(path);
+                    if (!Files.exists(docPath) || !Files.isRegularFile(docPath)) {
+                        return "文件不存在或不是普通文件: " + path;
+                    }
+                    DocIndex indexer = new DocIndex();
+                    DocIndex.DocIndexResult result = indexer.indexFile(docPath.toAbsolutePath().toString());
+                    return result.message();
+                }
+        ));
+
+        tools.put("search_docs", new Tool(
+                "search_docs",
+                "在文档知识库中搜索与问题描述相关的文档片段。" +
+                        "结果包含文档标题、类型和内容片段。" +
+                        "⚠️ 仅当用户明确要求查阅文档库、知识库、文档资料时才调用此工具。" +
+                        "不要在用户未提及文档的情况下主动检索文档库。" +
+                        "默认 top_k=3，可显式指定（上限 20）",
+                createParameters(
+                        new Param("query", "string", "自然语言查询描述，例如'用户认证流程说明'", true),
+                        new Param("top_k", "integer", "返回结果数量（默认 3，上限 20）", false)
                 ),
                 args -> {
                     String query = args.get("query");
-                    int topK = 5;
+                    int topK = 3;
                     try {
                         if (args.containsKey("top_k")) {
                             topK = Integer.parseInt(args.get("top_k"));
                         }
                     } catch (NumberFormatException ignored) {
                     }
-                    topK = Math.max(1, Math.min(topK, 30));
+                    topK = Math.max(1, Math.min(topK, 20));
 
-                    try (CodeRetriever retriever = new CodeRetriever(projectPath)) {
+                    try (DocRetriever retriever = new DocRetriever()) {
                         var stats = retriever.getStats();
                         if (stats.chunkCount() == 0) {
-                            return "代码库尚未索引，请先使用 /index 命令索引当前项目。";
+                            return "文档库为空，请先使用 upload_document 上传文档。";
                         }
-
-                        List<VectorStore.SearchResult> results = retriever.hybridSearch(query, topK);
+                        List<VectorStore.DocSearchResult> results = retriever.hybridSearch(query, topK);
                         if (results.isEmpty()) {
-                            return "未找到与查询相关的代码。";
+                            return "未找到与查询相关的文档。";
                         }
-
-                        return SearchResultFormatter.formatForTool(query, results);
+                        return DocResultFormatter.formatForTool(query, results);
                     } catch (Exception e) {
-                        return "代码检索失败: " + e.getMessage();
+                        return "文档检索失败: " + e.getMessage();
                     }
                 }
         ));
@@ -720,6 +796,53 @@ public class ToolRegistry {
                     String scope = "global".equalsIgnoreCase(args.get("scope")) ? "global" : "project";
                     memorySaver.accept(normalized, scope);
                     return "💾 已保存到长期记忆(" + scope + "): " + normalized;
+                }
+        ));
+
+        // search_session 工具
+        tools.put("search_session", new Tool(
+                "search_session",
+                "搜索历史会话记录（基于 FTS5 全文检索）。每个 CLI 启动周期为一个 session（自增编号），包含用户消息、助手回复和工具结果。当你需要回忆之前对话中用户提到过的事情、你执行过的操作、或之前的决策时，调用此工具。",
+                createParameters(
+                        new Param("query", "string", "搜索关键词，例如'登录页面'、'UserService'。基于 jieba 分词的中英文混合检索。", true),
+                        new Param("limit", "integer", "最多返回条数，默认 10，上限 50", false),
+                        new Param("session_id", "integer", "限定搜索某个 session（可选，默认搜索所有历史 session）", false)
+                ),
+                args -> {
+                    String query = args.get("query");
+                    if (query == null || query.isBlank()) {
+                        return "search_session 失败: query 不能为空";
+                    }
+                    if (sessionSearcher == null) {
+                        return "search_session 失败: 会话存储未初始化";
+                    }
+                    int limit = Math.min(parseInt(args.get("limit"), 10), 50);
+                    Integer sessionId = null;
+                    if (args.containsKey("session_id")) {
+                        try {
+                            sessionId = Integer.parseInt(args.get("session_id"));
+                            if (sessionId <= 0) sessionId = null;
+                        } catch (NumberFormatException ignored) {}
+                    }
+
+                    List<SessionEntry> results = sessionSearcher.search(query, limit, sessionId);
+                    if (results.isEmpty()) {
+                        return "未找到匹配的历史会话记录。";
+                    }
+
+                    StringBuilder sb = new StringBuilder("历史会话检索结果 (").append(results.size()).append(" 条):\n\n");
+                    for (SessionEntry entry : results) {
+                        sb.append("  [Session ").append(entry.sessionId())
+                          .append(" #").append(entry.seq()).append(" / ")
+                          .append(entry.role()).append(" @")
+                          .append(entry.sessionCreatedAt()).append("]\n  ")
+                          .append(entry.content(), 0, Math.min(entry.content().length(), 300))
+                          .append(entry.content().length() > 300 ? "..." : "")
+                          .append("\n\n");
+                    }
+                    sb.append("---\n提示: 可用 session_id=%d 过滤到某个会话。".formatted(
+                            results.get(0).sessionId()));
+                    return sb.toString().trim();
                 }
         ));
     }
@@ -1362,6 +1485,15 @@ public class ToolRegistry {
         public boolean hasImageParts() {
             return imageParts != null && !imageParts.isEmpty();
         }
+    }
+
+    /**
+     * Session 搜索注入接口，由 MemoryManager::searchSession 实现。
+     * 供 search_session 工具调用。
+     */
+    @FunctionalInterface
+    public interface SessionSearcher {
+        List<SessionEntry> search(String query, int limit, Integer sessionId);
     }
 
     public interface ToolExecutor {

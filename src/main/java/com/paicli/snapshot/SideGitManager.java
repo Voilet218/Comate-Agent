@@ -13,6 +13,8 @@ import org.eclipse.jgit.treewalk.TreeWalk;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
+import java.nio.file.InvalidPathException;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.nio.file.FileSystems;
@@ -65,7 +67,20 @@ public class SideGitManager {
             return null;
         }
         try (Git git = openGit()) {
-            git.add().addFilepattern(".").call();
+            try {
+                git.add().addFilepattern(".").call();
+            } catch (InvalidPathException e) {
+                System.err.println("❌ 快照诊断: InvalidPathException 触发");
+                System.err.println("   项目根: " + projectRoot);
+                System.err.println("   gitDir: " + gitDir);
+                System.err.println("   异常路径: " + e.getInput());
+                System.err.println("   异常原因: " + e.getReason());
+                System.err.println("   异常索引: " + e.getIndex());
+                // 扫描项目下前 100 个文件/目录，找出可能的可疑路径
+                System.err.println("   项目文件列表（前 100）:");
+                listFilesForDiagnostics(projectRoot, 100);
+                throw e;
+            }
             git.add().setUpdate(true).addFilepattern(".").call();
             String message = phase.label() + " " + safeTurnId(turnId)
                     + (summary == null || summary.isBlank() ? "" : "\n\n" + summary.trim());
@@ -356,6 +371,27 @@ public class SideGitManager {
             return sb.toString();
         } catch (NoSuchAlgorithmException e) {
             throw new IllegalStateException("SHA-256 unavailable", e);
+        }
+    }
+
+    /**
+     * 诊断：遍历项目目录输出文件列表，用于排查 "Invalid path: nul" 异常
+     */
+    private static void listFilesForDiagnostics(Path root, int maxCount) {
+        int[] count = {0};
+        try (var stream = Files.walk(root)) {
+            stream.limit(maxCount).forEach(path -> {
+                try {
+                    String name = path.getFileName().toString();
+                    boolean isDir = Files.isDirectory(path);
+                    System.err.println("   [" + (isDir ? "DIR" : "FIL") + "] " + path);
+                } catch (Exception ignored) {
+                    // 跳过无法读取的路径
+                }
+                count[0]++;
+            });
+        } catch (Exception ignored) {
+            System.err.println("   遍历目录失败: " + root);
         }
     }
 }

@@ -147,6 +147,7 @@ public class PlanExecuteAgent {
         this.toolRegistry.setContextProfile(this.memoryManager.getContextProfile());
         this.memoryManager.setProjectPath(this.toolRegistry.getProjectPath());
         this.toolRegistry.setScopedMemorySaver(this.memoryManager::storeFact);
+        this.toolRegistry.setSessionSearcher(this.memoryManager::searchSession);
     }
 
     private static PrintStream deferredSystemOut() {
@@ -438,7 +439,7 @@ public class PlanExecuteAgent {
      */
     private TaskRunResult executeTask(String goal, ExecutionPlan plan, Task task,
                                       StreamState streamState, PrintStream out) throws IOException {
-        String prompt = promptAssembler.assemble(PromptMode.PLAN, PromptContext.builder()
+        String prompt = promptAssembler.assemble(PromptMode.WORKER, PromptContext.builder()
                 .variable("taskType", task.getType())
                 .variable("taskDescription", task.getDescription())
                 .externalContext(buildExternalContext())

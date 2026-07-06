@@ -5,6 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import okhttp3.*;
 
+import java.io.BufferedReader;
+import java.io.File;
+import java.io.FileReader;
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
 
@@ -137,16 +140,49 @@ public class EmbeddingClient {
         };
     }
 
+    /**
+     * 从环境变量、系统属性或 .env 文件中读取配置值。
+     * 优先级：System.getenv > System.getProperty > .env 文件 > 默认值
+     */
     private static String getEnv(String key, String defaultValue) {
+        // 1. 系统环境变量
         String value = System.getenv(key);
         if (value != null && !value.isEmpty()) {
             return value;
         }
+        // 2. JVM 系统属性
         value = System.getProperty(key);
         if (value != null && !value.isEmpty()) {
             return value;
         }
+        // 3. .env 文件（当前目录 + 用户主目录）
+        value = readFromDotEnv(key);
+        if (value != null && !value.isEmpty()) {
+            return value;
+        }
         return defaultValue;
+    }
+
+    /**
+     * 从 .env 文件读取指定 key 的值，与 PaiCliConfig.readFromDotEnv 逻辑一致。
+     * 查找顺序：当前目录 .env → 用户主目录 .env
+     */
+    static String readFromDotEnv(String key) {
+        File[] envFiles = { new File(".env"), new File(System.getProperty("user.home"), ".env") };
+        for (File envFile : envFiles) {
+            if (!envFile.exists()) continue;
+            try (BufferedReader reader = new BufferedReader(new FileReader(envFile))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) continue;
+                    if (line.startsWith(key + "=")) {
+                        return line.substring((key + "=").length()).trim();
+                    }
+                }
+            } catch (IOException ignored) {}
+        }
+        return null;
     }
 
     public String getProvider() {
